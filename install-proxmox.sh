@@ -36,6 +36,10 @@ pve_country="us"
 pve_filesystem="ext4"
 pve_zfs_raid="raid1"
 pve_disk_list=""
+# ZFS Encryption parameters
+zfs_encryption=false
+zfs_encryption_password=""
+zfs_encryption_ssh_port="2222"
 
 # Function to show help message
 show_help() {
@@ -53,6 +57,9 @@ show_help() {
     echo "  --yes                         Skip all confirmation prompts (auto-accept)"
     echo "  --proxmox-version VERSION     Specify Proxmox version (default: latest)"
     echo "                                Examples: latest, 8, 8.2, 8.2-1"
+    echo "  --enable-zfs-encryption       Enable Native ZFS Encryption (requires ZFS filesystem)"
+    echo "  --zfs-encryption-password PWD Password for ZFS root key (required if encryption enabled)"
+    echo "  --zfs-encryption-ssh-port PORT Port for Dropbear SSH during boot unlock (default: 2222)"
     echo "  --automated-install           [EXPERIMENTAL] Use automated unattended installation"
     echo "                                Only works with Proxmox 9+, skips VNC manual setup"
     echo ""
@@ -174,6 +181,14 @@ describe_plugin() {
             echo "Required options:"
             echo "    --private-subnet CIDR            Set private subnet (e.g., 192.168.20.0/24)"
             ;;
+        "enable_zfs_encryption")
+            echo "[Optional]"
+            echo "Enables native ZFS encryption and Dropbear SSH for remote unlocking."
+            echo "Required options:"
+            echo "    --enable-zfs-encryption         Enable this feature"
+            echo "    --zfs-encryption-password PWD   Set root encryption password"
+            echo "    --pve-filesystem zfs            Must use ZFS filesystem"
+            ;;
         *)
             echo "No description available"
             echo
@@ -221,6 +236,9 @@ run_plugin() {
         "setup_private_subnet")
             setup_private_subnet
             ;;
+        "enable_zfs_encryption")
+            enable_zfs_encryption
+            ;;
         *)
             echo "Unknown plugin: $1"
             ;;
@@ -228,7 +246,7 @@ run_plugin() {
 }
 
 # Default list of plugins
-plugin_list="update_locale_gen,set_network,run_tteck_post-pve-install,register_acme_account,disable_rpcbind,install_iptables_rule,snat_zone,add_ssh_key_to_authorized_keys,change_ssh_port,add_tun_lxc_device,zabbix_agent,setup_private_subnet"
+plugin_list="update_locale_gen,set_network,enable_zfs_encryption,run_tteck_post-pve-install,register_acme_account,disable_rpcbind,install_iptables_rule,snat_zone,add_ssh_key_to_authorized_keys,change_ssh_port,add_tun_lxc_device,zabbix_agent,setup_private_subnet"
 
 # Parsing command line options
 while [[ $# -gt 0 ]]; do
@@ -362,6 +380,20 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pve-disk-list)
             pve_disk_list="$2"
+            shift
+            shift
+            ;;
+        --enable-zfs-encryption)
+            zfs_encryption=true
+            shift
+            ;;
+        --zfs-encryption-password)
+            zfs_encryption_password="$2"
+            shift
+            shift
+            ;;
+        --zfs-encryption-ssh-port)
+            zfs_encryption_ssh_port="$2"
             shift
             shift
             ;;
@@ -1150,7 +1182,333 @@ EOF
     echo -e "${CLR_GREEN}✓ Private subnet configured on vmbr1${CLR_RESET}"
 }
 
-# Function to install Zabbix Agent
+enable_zfs_encryption() {
+    # Check if encryption is requested
+    [ "$zfs_encryption" != true ] && return 0
+
+    echo -e "${CLR_CYAN}Setting up ZFS native encryption...${CLR_RESET}"
+
+    # Validate password is provided
+    if [ -z "$zfs_encryption_password" ]; then
+        echo -e "${CLR_RED}Error: ZFS encryption enabled but no password provided (--zfs-encryption-password)${CLR_RESET}"
+        return 1
+    fi
+
+    # Verify ZFS pool exists on remote system
+    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "zpool list rpool >/dev/null 2>&1"; then
+        echo -e "${CLR_RED}Error: ZFS pool 'rpool' not found. ZFS encryption requires ZFS filesystem.${CLR_RESET}"
+        return 1
+    fi
+
+    echo -e "${CLR_CYAN}Installing required packages for remote unlock (dropbear-initramfs)...${CLR_RESET}"
+    
+    # 1. Install dropbear-initramfs
+    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+        set -e
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y dropbear-initramfs zfs-initramfs busybox
+    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
+        echo -e "${CLR_RED}Error: Failed to install required packages${CLR_RESET}"
+        return 1
+    fi
+
+    # 2. Configure Dropbear
+    echo -e "${CLR_CYAN}Configuring Dropbear SSH for initramfs...${CLR_RESET}"
+    
+    # Get public key to authorize (use the one we found/generated earlier)
+    local pub_key=""
+    if [ -f /root/.ssh/id_rsa.pub ]; then
+        pub_key=$(cat /root/.ssh/id_rsa.pub)
+    elif [ -f "$ssh_key" ]; then
+         pub_key=$(cat "$ssh_key")
+    else
+         echo -e "${CLR_YELLOW}Warning: No local public SSH key found to authorize for Dropbear. Trying to generate one...${CLR_RESET}"
+         ssh-keygen -t rsa -N "" -f /root/.ssh/id_rsa
+         pub_key=$(cat /root/.ssh/id_rsa.pub)
+    fi
+
+    # Validate we have a public key
+    if [ -z "$pub_key" ]; then
+        echo -e "${CLR_RED}Error: No SSH public key available${CLR_RESET}"
+        return 1
+    fi
+
+    # Configure remote server
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+        set -e
+        # Add public key to dropbear authorized_keys
+        mkdir -p /etc/dropbear-initramfs
+        echo '$pub_key' >> /etc/dropbear-initramfs/authorized_keys
+        chmod 700 /etc/dropbear-initramfs
+        chmod 600 /etc/dropbear-initramfs/authorized_keys
+
+        # Configure Dropbear options (port, etc)
+        # We ensure it listens on the specified port and forces the zfsunlock command on login
+        
+        # Create the zfsunlock script
+        cat <<'UNLOCK' > /usr/local/bin/zfsunlock
+#!/bin/sh
+echo "Unlocking ZFS datasets..."
+if zfs load-key -a; then
+    echo "Keys loaded successfully."
+    if zfs get -H keystatus rpool/ROOT 2>/dev/null | grep -q available; then
+        echo "Root dataset unlocked. Killing dropbear to resume boot..."
+        killall dropbear 2>/dev/null
+        exit 0
+    else
+        echo "Warning: Root dataset status unclear"
+        exit 0
+    fi
+else
+    echo "Failed to load keys. Please check your passphrase."
+    exit 1
+fi
+UNLOCK
+        chmod +x /usr/local/bin/zfsunlock
+
+        # Create hook to include zfsunlock in initramfs
+        if [ ! -f /etc/initramfs-tools/hooks/zfsunlock_hook ]; then
+            cat <<'HOOK' > /etc/initramfs-tools/hooks/zfsunlock_hook
+#!/bin/sh
+PREREQ=""
+prereqs() {
+    echo "\$PREREQ"
+}
+case \$1 in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /usr/local/bin/zfsunlock /bin/zfsunlock
+HOOK
+            chmod +x /etc/initramfs-tools/hooks/zfsunlock_hook
+        fi
+
+        # Update Dropbear config to force this command
+        # Note: Using $zfs_encryption_ssh_port from outer shell scope
+        if grep -q '^#\?DROPBEAR_OPTIONS=' /etc/dropbear-initramfs/config 2>/dev/null; then
+            sed -i 's|^#\?DROPBEAR_OPTIONS=.*|DROPBEAR_OPTIONS=\"-p $zfs_encryption_ssh_port -j -k -c /bin/zfsunlock\"|' /etc/dropbear-initramfs/config
+        else
+            echo 'DROPBEAR_OPTIONS=\"-p $zfs_encryption_ssh_port -j -k -c /bin/zfsunlock\"' >> /etc/dropbear-initramfs/config
+        fi
+
+        # Configure static IP in initramfs
+        echo 'Configuring network for initramfs...'
+        
+        # Extract IP/CIDR and Gateway from interfaces file
+        IP_CIDR=\$(grep -E '^\s*address' /etc/network/interfaces | awk '{print \$2}' | head -n1)
+        GW=\$(grep -E '^\s*gateway' /etc/network/interfaces | awk '{print \$2}' | head -n1)
+        
+        if [ -n "\$IP_CIDR" ] && [ -n "\$GW" ]; then
+            IP=\${IP_CIDR%/*}
+            CIDR=\${IP_CIDR#*/}
+            
+            # Default CIDR to 24 if extraction failed
+            [ -z "\$CIDR" ] && CIDR=24
+            
+            # Calculate netmask from CIDR using pure shell
+            FULL_OCTETS=\$((CIDR / 8))
+            REM_BITS=\$((CIDR % 8))
+            MASK=""
+            
+            for i in 1 2 3 4; do
+                if [ \$i -le \$FULL_OCTETS ]; then
+                    VAL=255
+                elif [ \$i -eq \$((FULL_OCTETS + 1)) ]; then
+                    VAL=\$(( 256 - (1 << (8 - REM_BITS)) ))
+                else
+                    VAL=0
+                fi
+                [ -z "\$MASK" ] && MASK="\$VAL" || MASK="\${MASK}.\$VAL"
+            done
+            
+            # Add kernel parameter to initramfs.conf
+            IP_PARAM="IP=\${IP}::\${GW}:\${MASK}:proxmox::off"
+            echo "Network config: \$IP_PARAM"
+            echo "\$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
+        else
+            echo 'Warning: Could not detect network config. Manual configuration may be needed.'
+        fi
+
+        # Enable zfs-load-key service
+        cat <<'SERVICE' > /etc/systemd/system/zfs-load-keys.service
+[Unit]
+Description=Load ZFS encryption keys
+DefaultDependencies=no
+After=zfs-import.target
+Before=zfs-mount.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/zfs load-key -a
+StandardInput=tty-force
+
+[Install]
+WantedBy=zfs-mount.service
+SERVICE
+        
+        systemctl enable zfs-load-keys.service 2>&1 || true
+        
+        echo 'Updating initramfs...'
+        update-initramfs -u -k all
+    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"
+
+    # 3. Perform the ZFS Encryption Migration
+    echo -e "${CLR_CYAN}Starting ZFS encryption migration (ROOT dataset)...${CLR_RESET}"
+    echo -e "${CLR_YELLOW}This process will temporarily destroy datasets. Do not interrupt!${CLR_RESET}"
+    
+    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+        set -e  # Exit on any error
+        
+        # Securely create password file (mode 600 before writing)
+        umask 077
+        touch /tmp/zfs_pass
+        chmod 600 /tmp/zfs_pass
+        cat > /tmp/zfs_pass << 'PASSEOF'
+$zfs_encryption_password
+PASSEOF
+        
+        # Ensure pool is imported
+        zpool import -f rpool 2>/dev/null || true
+        
+        # Verify datasets exist before proceeding
+        if ! zfs list rpool/ROOT >/dev/null 2>&1; then
+            echo 'Error: rpool/ROOT dataset not found'
+            rm -f /tmp/zfs_pass
+            exit 1
+        fi
+        
+        echo 'Creating snapshot of ROOT dataset...'
+        zfs snapshot -r rpool/ROOT@copy
+        
+        echo 'Copying ROOT to temporary location...'
+        if ! zfs send -R rpool/ROOT@copy | zfs receive rpool/copyroot; then
+            echo 'Error: Failed to copy ROOT dataset'
+            zfs destroy -r rpool/ROOT@copy 2>/dev/null || true
+            rm -f /tmp/zfs_pass
+            exit 1
+        fi
+        
+        # Verify copy succeeded before destroying original
+        if ! zfs list rpool/copyroot/pve-1 >/dev/null 2>&1; then
+            echo 'Error: Temporary copy verification failed'
+            zfs destroy -r rpool/copyroot 2>/dev/null || true
+            zfs destroy -r rpool/ROOT@copy 2>/dev/null || true
+            rm -f /tmp/zfs_pass
+            exit 1
+        fi
+        
+        echo 'Destroying original ROOT dataset...'
+        zfs destroy -r rpool/ROOT
+        
+        echo 'Creating encrypted ROOT dataset...'
+        if ! cat /tmp/zfs_pass | zfs create -o encryption=on -o keyformat=passphrase -o compression=on -o acltype=posixacl -o xattr=sa -o dnodesize=auto rpool/ROOT; then
+            echo 'Error: Failed to create encrypted ROOT'
+            # Try to restore from backup
+            zfs send -R rpool/copyroot@copy 2>/dev/null | zfs receive rpool/ROOT || true
+            rm -f /tmp/zfs_pass
+            exit 1
+        fi
+        
+        echo 'Restoring data to encrypted dataset...'
+        if ! zfs send -R rpool/copyroot/pve-1@copy | zfs receive -x encryption rpool/ROOT/pve-1; then
+            echo 'Error: Failed to restore data'
+            rm -f /tmp/zfs_pass
+            exit 1
+        fi
+        
+        # Clean up temporary datasets and snapshots
+        zfs destroy -r rpool/copyroot
+        zfs destroy rpool/ROOT/pve-1@copy 2>/dev/null || true
+        
+        # Configure boot filesystem
+        echo 'Configuring boot settings...'
+        zfs set mountpoint=/ rpool/ROOT/pve-1
+        zpool set bootfs=rpool/ROOT/pve-1 rpool
+        
+        # Verify pool integrity
+        zpool export rpool
+        zpool import -f rpool
+        
+        # Verify encryption is enabled
+        if ! zfs get -H encryption rpool/ROOT | grep -q 'aes-256-gcm\|on'; then
+            echo 'Warning: Encryption verification inconclusive'
+        fi
+        
+        # Secure cleanup
+        shred -u /tmp/zfs_pass 2>/dev/null || rm -f /tmp/zfs_pass
+    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
+        echo -e "${CLR_RED}Error: ROOT dataset encryption failed${CLR_RESET}"
+        return 1
+    fi
+
+    echo -e "${CLR_GREEN}✓ ZFS ROOT encryption complete.${CLR_RESET}"
+    
+    # 4. Encrypt rpool/data (VM storage)
+    echo -e "${CLR_CYAN}Encrypting rpool/data (VM storage)...${CLR_RESET}"
+    
+    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+        set -e
+        
+        # Verify data dataset exists
+        if ! zfs list rpool/data >/dev/null 2>&1; then
+            echo 'Dataset rpool/data does not exist, skipping'
+            exit 0
+        fi
+        
+        # Generate keyfile securely
+        umask 077
+        openssl rand -hex 32 > /root/pve-data.key
+        chmod 600 /root/pve-data.key
+        
+        echo 'Snapshotting data dataset...'
+        zfs snapshot -r rpool/data@copy
+        
+        echo 'Copying to temporary location...'
+        if ! zfs send -R rpool/data@copy | zfs receive rpool/copydata; then
+            echo 'Error: Failed to copy data dataset'
+            zfs destroy -r rpool/data@copy 2>/dev/null || true
+            exit 1
+        fi
+        
+        zfs destroy -r rpool/data
+        
+        echo 'Creating encrypted data dataset...'
+        if ! zfs create -o encryption=on -o keyformat=hex -o keylocation=file:///root/pve-data.key -o compression=on rpool/data; then
+            echo 'Error: Failed to create encrypted data dataset'
+            # Attempt rollback
+            zfs send -R rpool/copydata@copy 2>/dev/null | zfs receive rpool/data || true
+            exit 1
+        fi
+        
+        # Restore child datasets if they exist
+        if zfs list -H -r -o name rpool/copydata 2>/dev/null | grep -q 'rpool/copydata/.'; then
+            echo 'Restoring child datasets...'
+            zfs send -R rpool/copydata@copy | zfs receive -x encryption rpool/data || true
+        fi
+        
+        zfs destroy -r rpool/copydata
+        echo 'Data dataset encryption complete'
+    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
+        echo -e "${CLR_YELLOW}Warning: Data dataset encryption had issues (non-critical)${CLR_RESET}"
+    fi
+     
+    echo -e "${CLR_GREEN}✓ ZFS data encryption complete.${CLR_RESET}"
+    echo -e ""
+    echo -e "${CLR_GREEN}═══════════════════════════════════════════════════════${CLR_RESET}"
+    echo -e "${CLR_GREEN}  ZFS Encryption Setup Complete${CLR_RESET}"
+    echo -e "${CLR_GREEN}═══════════════════════════════════════════════════════${CLR_RESET}"
+    echo -e "${CLR_YELLOW}IMPORTANT: On first boot, unlock the disk remotely:${CLR_RESET}"
+    echo -e "  ${CLR_CYAN}ssh -p $zfs_encryption_ssh_port root@<server-ip>${CLR_RESET}"
+    echo -e "  (will auto-run zfsunlock and prompt for passphrase)"
+    echo -e ""
+    echo -e "${CLR_YELLOW}Save your encryption password securely!${CLR_RESET}"
+    echo -e "${CLR_GREEN}═══════════════════════════════════════════════════════${CLR_RESET}"
+}
+
 install_zabbix_agent() {
     if [[ -z "$zabbix_server_address" ]]; then
         echo "Error: zabbix_agent plugin requires --zabbix-server option."
