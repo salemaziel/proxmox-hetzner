@@ -29,7 +29,7 @@ automated_install=false
 # Automated install parameters
 pve_fqdn=""
 pve_email=""
-pve_timezone="Europe/Warsaw"
+pve_timezone="America/Los_Angeles"
 pve_root_password=""
 pve_keyboard="en-us"
 pve_country="us"
