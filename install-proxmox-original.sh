@@ -26,18 +26,16 @@ private_subnet=""
 no_color=false
 proxmox_version="latest"
 automated_install=false
-raid_luks_install=false
 # Automated install parameters
 pve_fqdn=""
 pve_email=""
-pve_timezone="America/Los_Angeles"
+pve_timezone="Europe/Warsaw"
 pve_root_password=""
 pve_keyboard="en-us"
 pve_country="us"
 pve_filesystem="ext4"
 pve_zfs_raid="raid1"
 pve_disk_list=""
-enable_luks=false
 
 # Function to show help message
 show_help() {
@@ -47,7 +45,6 @@ show_help() {
     echo "  --skip-installer              Skip Proxmox installer and boot directly from installed disks"
     echo "  --no-shutdown                 Do not shut down the virtual machine after finishing work"
     echo "  --rescue                      Start QEMU in rescue mode with VNC and attached disks"
-    echo "  --enable-luks                 Enable LUKS encryption and configure remote unlock (Dropbear)"
     echo "  --disable PLUGIN1,PLUGIN2     Disable specified plugins"
     echo "  --list-ifaces                 List network interfaces and exit"
     echo "  --iface-name NAME             Specify the network interface name directly"
@@ -58,8 +55,6 @@ show_help() {
     echo "                                Examples: latest, 8, 8.2, 8.2-1"
     echo "  --automated-install           [EXPERIMENTAL] Use automated unattended installation"
     echo "                                Only works with Proxmox 9+, skips VNC manual setup"
-    echo "  --raid-luks-install           Install via Debian debootstrap with mdadm RAID1 -> LUKS2 -> LVM -> ext4"
-    echo "                                Skips ISO/QEMU. Uses helper script install-proxmox-raid-luks.sh"
     echo ""
     echo "Automated install options (required with --automated-install):"
     echo "  --pve-fqdn FQDN               Fully qualified domain name (e.g., pve.example.com)"
@@ -111,9 +106,6 @@ show_help() {
     echo "     --pve-fqdn pve.example.com --pve-email admin@example.com \\"
     echo "     --pve-root-password SecurePass123 --pve-filesystem zfs \\"
     echo "     --pve-zfs-raid raid1 --pve-disk-list sda,sdb"
-    echo ""
-    echo "  # RAID1 + LUKS + LVM install (no ISO/QEMU):"
-    echo "  $0 --raid-luks-install --disks sda,sdb --luks-passphrase 'YourPassphrase'"
     echo ""
     echo "  # Install specific version with custom network interface:"
     echo "  $0 --proxmox-version 8.2-1 --iface-name enp0s31f6"
@@ -238,17 +230,6 @@ run_plugin() {
 # Default list of plugins
 plugin_list="update_locale_gen,set_network,run_tteck_post-pve-install,register_acme_account,disable_rpcbind,install_iptables_rule,snat_zone,add_ssh_key_to_authorized_keys,change_ssh_port,add_tun_lxc_device,zabbix_agent,setup_private_subnet"
 
-# Delegate to RAID+LUKS helper if requested
-if [[ " $* " == *" --raid-luks-install "* ]]; then
-    args=()
-    for arg in "$@"; do
-        [ "$arg" = "--raid-luks-install" ] && continue
-        args+=("$arg")
-    done
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    exec "$script_dir/install-proxmox-raid-luks.sh" "${args[@]}"
-fi
-
 # Parsing command line options
 while [[ $# -gt 0 ]]; do
     key="$1"
@@ -337,14 +318,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --automated-install)
             automated_install=true
-            shift
-            ;;
-        --raid-luks-install)
-            raid_luks_install=true
-            shift
-            ;;
-        --enable-luks)
-            enable_luks=true
             shift
             ;;
         --pve-fqdn)
@@ -777,7 +750,7 @@ show_block_devices() {
 
         # WWN
         if [ -f "$disk/device/wwid" ]; then
-            wwn=$(cat "$disk/remotedevice/wwid")
+            wwn=$(cat "$disk/device/wwid")
             echo "  WWN: $wwn"
         fi
     done
@@ -823,175 +796,6 @@ show_network_interfaces() {
 }
 
 # Function to generate answer.toml for automated Proxmox installation
-
-configure_luks_remote_unlock() {
-    local luks_password="$1"
-
-    echo -e "${CLR_BLUE}Starting LUKS Remote Unlock Configuration (Hetzner compatible)...${CLR_RESET}"
-
-    # Install necessary host tools if missing
-    if ! command -v vgscan &> /dev/null || ! command -v ipcalc &> /dev/null; then
-        apt-get update -qq && apt-get install -y lvm2 cryptsetup-bin ipcalc
-    fi
-
-    local unlocked_count=0
-
-    # Iterate over all detected hard disks
-    for disk in "${hard_disks[@]}"; do
-        # Wait for kernel to re-read partitions if needed
-        partprobe "$disk" || true
-        sleep 1
-        
-        local part_luks=""
-        # Check partition 3 first (Standard Proxmox)
-        if cryptsetup isLuks "${disk}p3" 2>/dev/null; then
-            part_luks="${disk}p3"
-        elif cryptsetup isLuks "${disk}3" 2>/dev/null; then
-             part_luks="${disk}3"
-        else
-            # Simple scan
-            for part in $(ls "${disk}"* 2>/dev/null | grep -E "[0-9]+$"); do
-                if cryptsetup isLuks "$part" 2>/dev/null; then
-                    part_luks="$part"
-                    break
-                fi
-            done
-        fi
-
-        if [ -n "$part_luks" ]; then
-            echo "Found LUKS container on $part_luks"
-            # Open LUKS with unique name per disk
-            local map_name="pve-luks-$(basename "$part_luks")"
-            if echo -n "$luks_password" | cryptsetup luksOpen "$part_luks" "$map_name" -; then
-                ((unlocked_count++))
-            else
-                echo -e "${CLR_RED}Failed to open LUKS container on $part_luks.${CLR_RESET}"
-            fi
-        fi
-    done
-
-    if [ "$unlocked_count" -eq 0 ]; then
-        echo -e "${CLR_RED}No LUKS partitions found or unlocked. Skipping remote unlock setup.${CLR_RESET}"
-        return 1
-    fi
-
-    # Detect if LVM or ZFS inside
-    local mount_point="/mnt/pve-config"
-    mkdir -p "$mount_point"
-    local fs_type=""
-
-    # Check for LVM
-    vgscan --mknodes
-    vgchange -ay
-    if [ -e /dev/pve/root ]; then
-        # Standard LVM layout
-        mount /dev/pve/root "$mount_point"
-        fs_type="lvm"
-    else
-        # Try ZFS (Proxmox ZFS on LUKS)
-        if zpool import -f -R "$mount_point" rpool; then
-             # ZFS mounted via altroot
-             fs_type="zfs"
-        else
-             echo -e "${CLR_RED}Could not mount root filesystem (neither LVM 'pve' nor ZFS 'rpool' found).${CLR_RESET}"
-             # Close all we opened
-             for map in $(dmsetup ls --target crypt | grep pve-luks | awk '{print $1}'); do
-                cryptsetup luksClose "$map"
-             done
-             return 1
-        fi
-    fi
-
-    echo "Mounted root filesystem ($fs_type) at $mount_point"
-
-    # Mount Boot/EFI from first disk
-    local first_disk="${hard_disks[0]}"
-    local part_efi="${first_disk}p2"
-    if [ -b "${first_disk}2" ]; then part_efi="${first_disk}2"; fi
-    
-    mount "$part_efi" "$mount_point/boot/efi" || echo "Warning: Could not mount EFI partition."
-
-    # Bind mounts for Chroot network access
-    for i in /dev /dev/pts /proc /sys /run; do mount -B $i "$mount_point$i"; done
-    
-    # DNS for apt
-    cp /etc/resolv.conf "$mount_point/etc/"
-
-    # Install Dropbear
-    echo "Installing dropbear-initramfs in chroot..."
-    chroot "$mount_point" apt-get update -qq
-    chroot "$mount_point" apt-get install -y dropbear-initramfs cryptsetup-initramfs ipcalc
-
-    # Configure SSH Key
-    mkdir -p "$mount_point/etc/dropbear/initramfs"
-    local ssh_key_file="/root/.ssh/id_rsa.pub"
-    if [ -f "$ssh_key_file" ]; then
-        cat "$ssh_key_file" >> "$mount_point/etc/dropbear/initramfs/authorized_keys"
-        chmod 600 "$mount_point/etc/dropbear/initramfs/authorized_keys"
-        echo "Added host public key to initramfs authorized_keys"
-    else
-        echo "Warning: No public key found at $ssh_key_file"
-    fi
-
-    # Configure Static IP for Dropbear
-    local main_ip=$(echo "$MAIN_IPV4_CIDR" | cut -d'/' -f1)
-    local main_mask_cidr=$(echo "$MAIN_IPV4_CIDR" | cut -d'/' -f2)
-    local main_mask=""
-    
-    # Use ipcalc from guest if available, or host
-    if command -v ipcalc &>/dev/null; then
-         main_mask=$(ipcalc -m "$MAIN_IPV4_CIDR" | grep Netmask | awk '{print $2}')
-    fi
-     if [ -z "$main_mask" ]; then
-        # Fallback for /24, /26, /27 common at Hetzner
-        case "$main_mask_cidr" in
-            24) main_mask="255.255.255.0";;
-            26) main_mask="255.255.255.192";;
-            27) main_mask="255.255.255.224";;
-            32) main_mask="255.255.255.255";;
-            *) main_mask="255.255.255.0";;
-        esac
-    fi
-
-    # Kernel IP format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
-    # We use empty hostname and device to let kernel pick
-    local ip_cfg="${main_ip}::${MAIN_IPV4_GW}:${main_mask}:::off"
-    
-    echo "Configuring initramfs IP: $ip_cfg"
-    echo "IP=$ip_cfg" > "$mount_point/etc/initramfs-tools/conf.d/static_ip"
-
-    if ! grep -q "DROPBEAR=y" "$mount_point/etc/initramfs-tools/initramfs.conf"; then
-        echo "DROPBEAR=y" >> "$mount_point/etc/initramfs-tools/initramfs.conf"
-    fi
-     # Ensure dropbear runs on port 22 or 2222. Default is 22.
-    
-    echo "Updating initramfs..."
-    chroot "$mount_point" update-initramfs -u
-
-    # Cleanup
-    echo "Cleaning up..."
-    umount -l "$mount_point/dev/pts"
-    umount -l "$mount_point/dev"
-    umount -l "$mount_point/proc"
-    umount -l "$mount_point/sys"
-    umount -l "$mount_point/run"
-    umount "$mount_point/boot/efi"
-    umount "$mount_point"
-    
-    if [ "$fs_type" == "lvm" ]; then
-        vgchange -an pve
-    elif [ "$fs_type" == "zfs" ]; then
-        zpool export rpool
-    fi
-    
-    # Close all opened LUKS
-    for map in $(dmsetup ls --target crypt | grep pve-luks | awk '{print $1}'); do
-        cryptsetup luksClose "$map"
-    done
-    
-    echo -e "${CLR_GREEN}✓ Remote unlock configured successfully.${CLR_RESET}"
-}
-
 generate_answer_toml() {
     local toml_file="$1"
 
@@ -1561,13 +1365,6 @@ if [ "$skip_installer" = false ]; then
     else
         eval "$qemu_command > /dev/null 2>&1"
     fi
-
-    # Post-Install Hook for LUKS
-    if [ "$enable_luks" = true ]; then
-        echo -e "${CLR_CYAN}Detected LUKS requested. Attempting to configure remote unlock...${CLR_RESET}"
-        # Configure dropbear and initramfs (scanning all disks)
-        configure_luks_remote_unlock "$pve_root_password"
-    fi
 fi
 
 # Set up bridge networking if --ovh is specified
@@ -1623,29 +1420,6 @@ bg_pid=$!
 # Performing SSH operations
 if [ ! -f /root/.ssh/id_rsa ]; then
     ssh-keygen -b 2048 -t rsa -f /root/.ssh/id_rsa -q -N ""
-fi
-
-# LUKS Unlock Check
-if [ "$enable_luks" = true ]; then
-    echo -e "${CLR_CYAN}Detected LUKS. Monitoring for Dropbear Unlock Wait at $SSHIP:$SSHPORT...${CLR_RESET}"
-    echo "Wait for VM to boot into initramfs..."
-    # Loop for 2 minutes
-    for ((i=0;i<24;i++)); do
-        # Check if port 5555/22 is answering
-        if nc -z -w 2 "$SSHIP" "$SSHPORT"; then
-             echo "Port open. Attempting unlock..."
-             # We use the private key we detected/generated earlier for authentication
-             # And pass the password to the FIFO
-             ssh -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" -p "$SSHPORT" root@"$SSHIP" "echo -n '$pve_root_password' > /lib/cryptsetup/passfifo"
-             if [ $? -eq 0 ]; then
-                 echo -e "${CLR_GREEN}Unlock command sent. Waiting for boot...${CLR_RESET}"
-                 break
-             fi
-        fi
-        sleep 5
-    done
-    # Give OS time to boot after unlock
-    sleep 20
 fi
 
 echo -e "${CLR_CYAN}Waiting for start SSH server on proxmox...${CLR_RESET}"
