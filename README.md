@@ -117,6 +117,12 @@ update-initramfs -u
 
 `https://IP_ADDRESS:8006/`
 
+### Additional Guides
+
+- [README-v0.md](README-v0.md)
+- [README-v1.md](README-v1.md)
+- [README-v2.md](README-v2.md)
+
 #### Special Thanks
 
 [Ariadata](https://github.com/ariadata)
