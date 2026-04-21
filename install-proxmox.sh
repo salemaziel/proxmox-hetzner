@@ -1223,6 +1223,7 @@ enable_zfs_encryption() {
          pub_key=$(cat "$ssh_key")
     else
          echo -e "${CLR_YELLOW}Warning: No local public SSH key found to authorize for Dropbear. Trying to generate one...${CLR_RESET}"
+         mkdir -p /root/.ssh
          ssh-keygen -t rsa -N "" -f /root/.ssh/id_rsa
          pub_key=$(cat /root/.ssh/id_rsa.pub)
     fi
@@ -1238,7 +1239,7 @@ enable_zfs_encryption() {
         set -e
         # Add public key to dropbear authorized_keys
         mkdir -p /etc/dropbear-initramfs
-        echo '$pub_key' >> /etc/dropbear-initramfs/authorized_keys
+        grep -qF "$pub_key" /etc/dropbear-initramfs/authorized_keys 2>/dev/null || echo '$pub_key' >> /etc/dropbear-initramfs/authorized_keys
         chmod 700 /etc/dropbear-initramfs
         chmod 600 /etc/dropbear-initramfs/authorized_keys
 
@@ -1327,7 +1328,11 @@ HOOK
             # Add kernel parameter to initramfs.conf
             IP_PARAM="IP=\${IP}::\${GW}:\${MASK}:proxmox::off"
             echo "Network config: \$IP_PARAM"
-            echo "\$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
+            if grep -q "^IP=" /etc/initramfs-tools/initramfs.conf; then
+                sed -i "s|^IP=.*|$IP_PARAM|" /etc/initramfs-tools/initramfs.conf
+            else
+                echo "$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
+            fi
         else
             echo 'Warning: Could not detect network config. Manual configuration may be needed.'
         fi
@@ -1360,16 +1365,14 @@ SERVICE
     echo -e "${CLR_CYAN}Starting ZFS encryption migration (ROOT dataset)...${CLR_RESET}"
     echo -e "${CLR_YELLOW}This process will temporarily destroy datasets. Do not interrupt!${CLR_RESET}"
     
+    # Securely transfer the password to the remote host via stdin
+    echo "$zfs_encryption_password" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "umask 077; cat > /tmp/zfs_pass; chmod 600 /tmp/zfs_pass"
+
     if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
         set -e  # Exit on any error
         
-        # Securely create password file (mode 600 before writing)
-        umask 077
-        touch /tmp/zfs_pass
-        chmod 600 /tmp/zfs_pass
-        cat > /tmp/zfs_pass << 'PASSEOF'
-$zfs_encryption_password
-PASSEOF
+        # Ensure pool is imported
+        zpool import -f rpool 2>/dev/null || true
         
         # Ensure pool is imported
         zpool import -f rpool 2>/dev/null || true
