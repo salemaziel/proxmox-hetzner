@@ -1213,14 +1213,18 @@ enable_zfs_encryption() {
     echo -e "${CLR_CYAN}Installing required packages for remote unlock (dropbear-initramfs)...${CLR_RESET}"
     
     # 1. Install dropbear-initramfs
-    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+    # Bug fix: capture-then-filter so ssh's exit code survives (piping to grep -v masks it).
+    local pkg_install_output=""
+    if ! pkg_install_output=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
         set -e
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y dropbear-initramfs zfs-initramfs busybox
-    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
+    " 2>&1); then
+        printf '%s\n' "$pkg_install_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
         echo -e "${CLR_RED}Error: Failed to install required packages${CLR_RESET}"
         return 1
     fi
+    printf '%s\n' "$pkg_install_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
 
     # 2. Configure Dropbear
     echo -e "${CLR_CYAN}Configuring Dropbear SSH for initramfs...${CLR_RESET}"
@@ -1392,7 +1396,9 @@ REMOTE_ZFS_CONFIG
     echo -e "${CLR_YELLOW}Migrating ROOT with staged copies and rollback protection. Do not interrupt!${CLR_RESET}"
 
     local pass_stage_output=""
-    if ! pass_stage_output=$(printf '%s\n' "$zfs_encryption_password" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+    # Bug fix: zfs create -o keyformat=passphrase reads the passphrase AND a confirmation,
+    # so /tmp/zfs_pass must contain the passphrase on two consecutive lines.
+    if ! pass_stage_output=$(printf '%s\n%s\n' "$zfs_encryption_password" "$zfs_encryption_password" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
         set -eu
         umask 077
         cat > /tmp/zfs_pass
@@ -1404,7 +1410,10 @@ REMOTE_ZFS_CONFIG
     fi
     printf '%s\n' "$pass_stage_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
     
-    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+    # Bug fix: capture output so ssh's exit code survives (piping to grep -v masks it,
+    # which previously caused silent rollback to be reported as success).
+    local root_migration_output=""
+    if ! root_migration_output=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
         set -eu
         set -o pipefail
 
@@ -1506,13 +1515,16 @@ REMOTE_ZFS_CONFIG
         fi
 
         log_root 'Configuring boot settings...'
-        zfs set mountpoint=/ \"\$RESTORED_BOOTFS\"
+        # Bug fix: use \`zfs set -u\` so mountpoint change doesn't attempt a live remount;
+        # \`/\` is currently mounted from rpool/ROOT-backup-pre-encryption/pve-1 and busy.
+        # The next boot mounts this dataset via initramfs after dropbear unlock.
+        zfs set -u mountpoint=/ \"\$RESTORED_BOOTFS\"
         zpool set bootfs=\"\$RESTORED_BOOTFS\" rpool
 
-        zpool export rpool
-        zpool import -f -N rpool
-        zfs load-key rpool/ROOT < \"\$PASSFILE\"
-        zfs mount \"\$RESTORED_BOOTFS\"
+        # NOTE: export/import/load-key/mount removed here. \`zpool export rpool\` cannot run
+        # while / is on rpool, and it's unnecessary: \`zfs create -o keyformat=passphrase\`
+        # already loaded the key on rpool/ROOT, and received children inherit the encryption
+        # root's loaded key. The on-disk encryption state is durable — boot will unlock fresh.
 
         if ! zfs get -H -o value encryption rpool/ROOT 2>/dev/null | grep -qv '^off$'; then
             echo 'Error: Encryption is not enabled on rpool/ROOT'
@@ -1525,7 +1537,7 @@ REMOTE_ZFS_CONFIG
         fi
 
         if ! zfs list \"\$RESTORED_BOOTFS\" >/dev/null 2>&1; then
-            echo 'Error: Restored ROOT child missing after pool re-import'
+            echo 'Error: Restored ROOT child missing'
             exit 1
         fi
 
@@ -1546,17 +1558,21 @@ REMOTE_ZFS_CONFIG
 
         trap - EXIT
         cleanup_root
-    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
+    " 2>&1); then
+        printf '%s\n' "$root_migration_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
         echo -e "${CLR_RED}Error: ROOT dataset encryption failed${CLR_RESET}"
         return 1
     fi
+    printf '%s\n' "$root_migration_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
 
     echo -e "${CLR_GREEN}✓ ZFS ROOT encryption complete.${CLR_RESET}"
     
     # 4. Encrypt rpool/data (VM storage)
     echo -e "${CLR_CYAN}Encrypting rpool/data (VM storage)...${CLR_RESET}"
     
-    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+    # Bug fix: capture output so ssh's exit code survives (piping to grep -v masks it).
+    local data_migration_output=""
+    if ! data_migration_output=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
         set -eu
         set -o pipefail
 
@@ -1665,10 +1681,12 @@ REMOTE_ZFS_CONFIG
 
         trap - EXIT
         echo 'Data dataset encryption complete'
-    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
+    " 2>&1); then
+        printf '%s\n' "$data_migration_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
         echo -e "${CLR_RED}Error: Data dataset encryption failed${CLR_RESET}"
         return 1
     fi
+    printf '%s\n' "$data_migration_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
      
     echo -e "${CLR_GREEN}✓ ZFS data encryption complete.${CLR_RESET}"
     echo -e ""
