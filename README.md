@@ -48,6 +48,55 @@ bash install-proxmox.sh --help
   - do not add real IP info in network configuration part (just leave defaults!)
   - close VNC window after system rebooted and waits for reconnect
 
+### Native ZFS Encryption
+
+Native ZFS encryption is supported for `rpool/ROOT` and `rpool/data`.
+
+- Required flags:
+  - `--enable-zfs-encryption`
+  - `--zfs-encryption-password 'your-passphrase'`
+- Optional flag:
+  - `--zfs-encryption-ssh-port 2222`
+- ZFS-only constraint:
+  - manual installs must select `zfs` in the Proxmox installer
+  - automated installs must use `--pve-filesystem zfs`
+- The installer validates this before running the encryption plugin and exits with a clear error on non-ZFS installs.
+
+Example:
+
+```shell
+bash install-proxmox.sh \
+  --automated-install \
+  --proxmox-version 9 \
+  --pve-fqdn pve.example.com \
+  --pve-email admin@example.com \
+  --pve-root-password 'SuperSecret123' \
+  --pve-filesystem zfs \
+  --enable-zfs-encryption \
+  --zfs-encryption-password 'CorrectHorseBatteryStaple' \
+  --zfs-encryption-ssh-port 2222
+```
+
+Behavior:
+
+- `rpool/ROOT` is converted to passphrase-based native ZFS encryption.
+- `rpool/data` is converted to native ZFS encryption with a local keyfile at `/root/pve-data.key`.
+- The migration uses snapshot, staging, backup rename, restore, and post-restore verification before cleanup.
+- `dropbear-initramfs` is installed so the root pool can be unlocked remotely during boot.
+
+First boot / remote unlock flow:
+
+1. Reboot the server after installation finishes.
+2. SSH into the initramfs Dropbear instance on the configured unlock port:
+
+```shell
+ssh -p 2222 root@<server-ip>
+```
+
+3. The forced `/bin/zfsunlock` command runs automatically and prompts for the `--zfs-encryption-password` passphrase.
+4. After `rpool/ROOT` is unlocked, boot continues.
+5. `rpool/data` is then unlocked automatically by `zfs-load-keys.service` using `/root/pve-data.key`.
+
 After installer reboots QEMU, the script will automaticaly configure network vmbr0 for a bridged network. It will also run the [Post Install Script](https://github.com/tteck/Proxmox/raw/main/misc/post-pve-install.sh)
 
 If you enable ACME make sure to pass an email with `-e, --acme-email EMAIL`

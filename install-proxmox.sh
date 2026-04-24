@@ -497,6 +497,23 @@ if [ "$automated_install" = true ]; then
     echo -e "${CLR_GREEN}✓ Required parameters validated${CLR_RESET}"
 fi
 
+validate_zfs_encryption_request() {
+    [ "$zfs_encryption" != true ] && return 0
+
+    if [ -z "$zfs_encryption_password" ]; then
+        echo -e "${CLR_RED}✗ Error: --enable-zfs-encryption requires --zfs-encryption-password${CLR_RESET}"
+        exit 1
+    fi
+
+    if [ "$automated_install" = true ] && [ "$pve_filesystem" != "zfs" ]; then
+        echo -e "${CLR_RED}✗ Error: --enable-zfs-encryption requires a ZFS install.${CLR_RESET}"
+        echo "Use --pve-filesystem zfs for automated installs."
+        exit 1
+    fi
+}
+
+validate_zfs_encryption_request
+
 WAN_IFACE=$(ip route show default | awk '/default/ {print $5}')
 PUBLIC_IPV4=$(ip -f inet addr show ${WAN_IFACE} | sed -En -e 's/.*inet ([0-9.]+).*/\1/p')
 
@@ -1188,18 +1205,6 @@ enable_zfs_encryption() {
 
     echo -e "${CLR_CYAN}Setting up ZFS native encryption...${CLR_RESET}"
 
-    # Validate password is provided
-    if [ -z "$zfs_encryption_password" ]; then
-        echo -e "${CLR_RED}Error: ZFS encryption enabled but no password provided (--zfs-encryption-password)${CLR_RESET}"
-        return 1
-    fi
-
-    # Verify ZFS pool exists on remote system
-    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "zpool list rpool >/dev/null 2>&1"; then
-        echo -e "${CLR_RED}Error: ZFS pool 'rpool' not found. ZFS encryption requires ZFS filesystem.${CLR_RESET}"
-        return 1
-    fi
-
     echo -e "${CLR_CYAN}Installing required packages for remote unlock (dropbear-initramfs)...${CLR_RESET}"
     
     # 1. Install dropbear-initramfs
@@ -1238,7 +1243,8 @@ enable_zfs_encryption() {
         set -e
         # Add public key to dropbear authorized_keys
         mkdir -p /etc/dropbear-initramfs
-        echo '$pub_key' >> /etc/dropbear-initramfs/authorized_keys
+        touch /etc/dropbear-initramfs/authorized_keys
+        grep -qxF '$pub_key' /etc/dropbear-initramfs/authorized_keys || echo '$pub_key' >> /etc/dropbear-initramfs/authorized_keys
         chmod 700 /etc/dropbear-initramfs
         chmod 600 /etc/dropbear-initramfs/authorized_keys
 
@@ -1251,7 +1257,7 @@ enable_zfs_encryption() {
 echo "Unlocking ZFS datasets..."
 if zfs load-key -a; then
     echo "Keys loaded successfully."
-    if zfs get -H keystatus rpool/ROOT 2>/dev/null | grep -q available; then
+    if zfs get -H -o value keystatus rpool/ROOT 2>/dev/null | grep -q available; then
         echo "Root dataset unlocked. Killing dropbear to resume boot..."
         killall dropbear 2>/dev/null
         exit 0
@@ -1327,7 +1333,11 @@ HOOK
             # Add kernel parameter to initramfs.conf
             IP_PARAM="IP=\${IP}::\${GW}:\${MASK}:proxmox::off"
             echo "Network config: \$IP_PARAM"
-            echo "\$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
+            if grep -q '^IP=' /etc/initramfs-tools/initramfs.conf 2>/dev/null; then
+                sed -i "s|^IP=.*|\$IP_PARAM|" /etc/initramfs-tools/initramfs.conf
+            else
+                echo "\$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
+            fi
         else
             echo 'Warning: Could not detect network config. Manual configuration may be needed.'
         fi
@@ -1343,8 +1353,7 @@ Before=zfs-mount.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/zfs load-key -a
-StandardInput=tty-force
+ExecStart=/usr/sbin/zfs load-key rpool/data
 
 [Install]
 WantedBy=zfs-mount.service
@@ -1358,88 +1367,149 @@ SERVICE
 
     # 3. Perform the ZFS Encryption Migration
     echo -e "${CLR_CYAN}Starting ZFS encryption migration (ROOT dataset)...${CLR_RESET}"
-    echo -e "${CLR_YELLOW}This process will temporarily destroy datasets. Do not interrupt!${CLR_RESET}"
+    echo -e "${CLR_YELLOW}Migrating ROOT with staged copies and rollback protection. Do not interrupt!${CLR_RESET}"
     
     if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
-        set -e  # Exit on any error
-        
-        # Securely create password file (mode 600 before writing)
+        set -eu
+        set -o pipefail
+
+        ROOT_SNAPSHOT='encroot-prep'
+        ROOT_STAGE='rpool/ROOT-copy-pre-encryption'
+        ROOT_BACKUP='rpool/ROOT-backup-pre-encryption'
+        PASSFILE='/tmp/zfs_pass'
+        ROOT_RENAMED=false
+        ROOT_CREATED=false
+        ROOT_DESCENDANT_COUNT=0
+
+        log_root() {
+            printf '[zfs-root] %s\n' \"\$1\"
+        }
+
+        cleanup_root() {
+            rm -f \"\$PASSFILE\"
+        }
+
+        rollback_root() {
+            log_root 'Rolling back ROOT migration...'
+            if [ \"\$ROOT_CREATED\" = true ] && zfs list rpool/ROOT >/dev/null 2>&1; then
+                zfs destroy -r rpool/ROOT || true
+            fi
+            if [ \"\$ROOT_RENAMED\" = true ] && zfs list \"\$ROOT_BACKUP\" >/dev/null 2>&1; then
+                zfs rename \"\$ROOT_BACKUP\" rpool/ROOT || true
+            fi
+        }
+
+        trap 'status=\$?; if [ \$status -ne 0 ]; then rollback_root; fi; cleanup_root; exit \$status' EXIT
+
         umask 077
-        touch /tmp/zfs_pass
-        chmod 600 /tmp/zfs_pass
-        cat > /tmp/zfs_pass << 'PASSEOF'
+        cat > \"\$PASSFILE\" << 'PASSEOF'
 $zfs_encryption_password
 PASSEOF
-        
-        # Ensure pool is imported
+
         zpool import -f rpool 2>/dev/null || true
-        
-        # Verify datasets exist before proceeding
+
         if ! zfs list rpool/ROOT >/dev/null 2>&1; then
             echo 'Error: rpool/ROOT dataset not found'
-            rm -f /tmp/zfs_pass
             exit 1
         fi
-        
-        echo 'Creating snapshot of ROOT dataset...'
-        zfs snapshot -r rpool/ROOT@copy
-        
-        echo 'Copying ROOT to temporary location...'
-        if ! zfs send -R rpool/ROOT@copy | zfs receive rpool/copyroot; then
-            echo 'Error: Failed to copy ROOT dataset'
-            zfs destroy -r rpool/ROOT@copy 2>/dev/null || true
-            rm -f /tmp/zfs_pass
+
+        if zfs get -H -o value encryption rpool/ROOT 2>/dev/null | grep -qv '^off$'; then
+            echo 'Error: rpool/ROOT is already encrypted; refusing to rerun migration'
             exit 1
         fi
-        
-        # Verify copy succeeded before destroying original
-        if ! zfs list rpool/copyroot/pve-1 >/dev/null 2>&1; then
-            echo 'Error: Temporary copy verification failed'
-            zfs destroy -r rpool/copyroot 2>/dev/null || true
-            zfs destroy -r rpool/ROOT@copy 2>/dev/null || true
-            rm -f /tmp/zfs_pass
+
+        if zfs list -H -r -t snapshot -o name rpool/ROOT 2>/dev/null | grep -Eq '@\${ROOT_SNAPSHOT}$'; then
+            echo 'Error: Existing ROOT preparation snapshot found. Resolve prior encryption attempt first.'
             exit 1
         fi
-        
-        echo 'Destroying original ROOT dataset...'
-        zfs destroy -r rpool/ROOT
-        
-        echo 'Creating encrypted ROOT dataset...'
-        if ! cat /tmp/zfs_pass | zfs create -o encryption=on -o keyformat=passphrase -o compression=on -o acltype=posixacl -o xattr=sa -o dnodesize=auto rpool/ROOT; then
-            echo 'Error: Failed to create encrypted ROOT'
-            # Try to restore from backup
-            zfs send -R rpool/copyroot@copy 2>/dev/null | zfs receive rpool/ROOT || true
-            rm -f /tmp/zfs_pass
+
+        if zfs list \"\$ROOT_STAGE\" >/dev/null 2>&1 || zfs list \"\$ROOT_BACKUP\" >/dev/null 2>&1; then
+            echo 'Error: Existing ROOT backup or staging dataset found. Resolve prior encryption attempt first.'
             exit 1
         fi
-        
-        echo 'Restoring data to encrypted dataset...'
-        if ! zfs send -R rpool/copyroot/pve-1@copy | zfs receive -x encryption rpool/ROOT/pve-1; then
-            echo 'Error: Failed to restore data'
-            rm -f /tmp/zfs_pass
+
+        BOOTFS=\$(zpool get -H -o value bootfs rpool 2>/dev/null || true)
+        if [ -z \"\$BOOTFS\" ] || [ \"\$BOOTFS\" = '-' ] || ! zfs list \"\$BOOTFS\" >/dev/null 2>&1; then
+            BOOTFS=\$(zfs list -H -r -o name rpool/ROOT | awk 'NR==2 {print; exit}')
+        fi
+
+        if [ -z \"\$BOOTFS\" ] || ! zfs list \"\$BOOTFS\" >/dev/null 2>&1; then
+            echo 'Error: Could not determine active ROOT child dataset'
             exit 1
         fi
-        
-        # Clean up temporary datasets and snapshots
-        zfs destroy -r rpool/copyroot
-        zfs destroy rpool/ROOT/pve-1@copy 2>/dev/null || true
-        
-        # Configure boot filesystem
-        echo 'Configuring boot settings...'
-        zfs set mountpoint=/ rpool/ROOT/pve-1
-        zpool set bootfs=rpool/ROOT/pve-1 rpool
-        
-        # Verify pool integrity
+
+        ROOT_CHILD_NAME=\${BOOTFS##*/}
+        ROOT_DESCENDANT_COUNT=\$(zfs list -H -r -o name rpool/ROOT | wc -l)
+
+        log_root 'Creating snapshot of ROOT dataset...'
+        zfs snapshot -r rpool/ROOT@\"\$ROOT_SNAPSHOT\"
+
+        log_root 'Copying ROOT to staging dataset...'
+        zfs send -R rpool/ROOT@\"\$ROOT_SNAPSHOT\" | zfs receive -u \"\$ROOT_STAGE\"
+
+        if ! zfs list \"\$ROOT_STAGE/\$ROOT_CHILD_NAME\" >/dev/null 2>&1; then
+            echo 'Error: Staged ROOT copy missing active child dataset'
+            exit 1
+        fi
+
+        log_root 'Renaming original ROOT dataset to backup...'
+        zfs rename rpool/ROOT \"\$ROOT_BACKUP\"
+        ROOT_RENAMED=true
+
+        log_root 'Creating encrypted replacement ROOT dataset...'
+        zfs create -o encryption=on -o keyformat=passphrase -o keylocation=prompt -o compression=on -o acltype=posixacl -o xattr=sa -o dnodesize=auto rpool/ROOT < \"\$PASSFILE\"
+        ROOT_CREATED=true
+
+        log_root 'Restoring ROOT datasets into encrypted parent...'
+        zfs send -R \"\$ROOT_STAGE@\$ROOT_SNAPSHOT\" | zfs receive -u -F -x encryption rpool/ROOT
+
+        RESTORED_BOOTFS=\"rpool/ROOT/\$ROOT_CHILD_NAME\"
+        if ! zfs list \"\$RESTORED_BOOTFS\" >/dev/null 2>&1; then
+            echo 'Error: Restored encrypted ROOT child not found'
+            exit 1
+        fi
+
+        log_root 'Configuring boot settings...'
+        zfs set mountpoint=/ \"\$RESTORED_BOOTFS\"
+        zpool set bootfs=\"\$RESTORED_BOOTFS\" rpool
+
         zpool export rpool
-        zpool import -f rpool
-        
-        # Verify encryption is enabled
-        if ! zfs get -H encryption rpool/ROOT | grep -q 'aes-256-gcm\|on'; then
-            echo 'Warning: Encryption verification inconclusive'
+        zpool import -f -N rpool
+        zfs load-key rpool/ROOT < \"\$PASSFILE\"
+        zfs mount \"\$RESTORED_BOOTFS\"
+
+        if ! zfs get -H -o value encryption rpool/ROOT 2>/dev/null | grep -qv '^off$'; then
+            echo 'Error: Encryption is not enabled on rpool/ROOT'
+            exit 1
         fi
-        
-        # Secure cleanup
-        shred -u /tmp/zfs_pass 2>/dev/null || rm -f /tmp/zfs_pass
+
+        if ! zpool get -H -o value bootfs rpool 2>/dev/null | grep -qx \"\$RESTORED_BOOTFS\"; then
+            echo 'Error: bootfs does not point to restored ROOT child'
+            exit 1
+        fi
+
+        if ! zfs list \"\$RESTORED_BOOTFS\" >/dev/null 2>&1; then
+            echo 'Error: Restored ROOT child missing after pool re-import'
+            exit 1
+        fi
+
+        if [ \"\$(zfs list -H -r -o name rpool/ROOT | wc -l)\" -ne \"\$ROOT_DESCENDANT_COUNT\" ]; then
+            echo 'Error: Restored ROOT dataset tree does not match the pre-migration dataset count'
+            exit 1
+        fi
+
+        if ! zfs get -H -o value keystatus rpool/ROOT 2>/dev/null | grep -qx 'available'; then
+            echo 'Error: Restored ROOT key is not loaded after migration'
+            exit 1
+        fi
+
+        log_root 'Cleaning up staging datasets and snapshots...'
+        zfs destroy -r \"\$ROOT_STAGE\"
+        zfs destroy -r \"\$ROOT_BACKUP\"
+        zfs destroy -r rpool/ROOT@\"\$ROOT_SNAPSHOT\"
+
+        trap - EXIT
+        cleanup_root
     " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
         echo -e "${CLR_RED}Error: ROOT dataset encryption failed${CLR_RESET}"
         return 1
@@ -1451,49 +1521,117 @@ PASSEOF
     echo -e "${CLR_CYAN}Encrypting rpool/data (VM storage)...${CLR_RESET}"
     
     if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
-        set -e
-        
-        # Verify data dataset exists
+        set -eu
+        set -o pipefail
+
+        DATA_SNAPSHOT='encdata-prep'
+        DATA_STAGE='rpool/data-copy-pre-encryption'
+        DATA_BACKUP='rpool/data-backup-pre-encryption'
+        DATA_CREATED=false
+        DATA_RENAMED=false
+        DATA_DESCENDANT_COUNT=0
+
+        log_data() {
+            printf '[zfs-data] %s\n' \"\$1\"
+        }
+
+        rollback_data() {
+            log_data 'Rolling back data migration...'
+            if [ \"\$DATA_CREATED\" = true ] && zfs list rpool/data >/dev/null 2>&1; then
+                zfs destroy -r rpool/data || true
+            fi
+            if [ \"\$DATA_RENAMED\" = true ] && zfs list \"\$DATA_BACKUP\" >/dev/null 2>&1; then
+                zfs rename \"\$DATA_BACKUP\" rpool/data || true
+            fi
+        }
+
+        trap 'status=\$?; if [ \$status -ne 0 ]; then rollback_data; fi; exit \$status' EXIT
+
         if ! zfs list rpool/data >/dev/null 2>&1; then
             echo 'Dataset rpool/data does not exist, skipping'
+            trap - EXIT
             exit 0
         fi
-        
-        # Generate keyfile securely
+
+        if zfs get -H -o value encryption rpool/data 2>/dev/null | grep -qv '^off$'; then
+            echo 'Error: rpool/data is already encrypted; refusing to rerun migration'
+            exit 1
+        fi
+
+        if zfs list -H -r -t snapshot -o name rpool/data 2>/dev/null | grep -Eq '@\${DATA_SNAPSHOT}$'; then
+            echo 'Error: Existing data preparation snapshot found. Resolve prior encryption attempt first.'
+            exit 1
+        fi
+
+        if zfs list \"\$DATA_STAGE\" >/dev/null 2>&1 || zfs list \"\$DATA_BACKUP\" >/dev/null 2>&1; then
+            echo 'Error: Existing data backup or staging dataset found. Resolve prior encryption attempt first.'
+            exit 1
+        fi
+
+        if [ -f /root/pve-data.key ]; then
+            echo 'Error: /root/pve-data.key already exists. Refusing to overwrite an existing data-encryption key.'
+            exit 1
+        fi
+
         umask 077
+        DATA_DESCENDANT_COUNT=\$(zfs list -H -r -o name rpool/data | wc -l)
         openssl rand -hex 32 > /root/pve-data.key
         chmod 600 /root/pve-data.key
-        
-        echo 'Snapshotting data dataset...'
-        zfs snapshot -r rpool/data@copy
-        
-        echo 'Copying to temporary location...'
-        if ! zfs send -R rpool/data@copy | zfs receive rpool/copydata; then
-            echo 'Error: Failed to copy data dataset'
-            zfs destroy -r rpool/data@copy 2>/dev/null || true
+
+        log_data 'Snapshotting data dataset...'
+        zfs snapshot -r rpool/data@\"\$DATA_SNAPSHOT\"
+
+        log_data 'Copying data dataset to staging...'
+        zfs send -R rpool/data@\"\$DATA_SNAPSHOT\" | zfs receive -u \"\$DATA_STAGE\"
+
+        log_data 'Renaming original data dataset to backup...'
+        zfs rename rpool/data \"\$DATA_BACKUP\"
+        DATA_RENAMED=true
+
+        log_data 'Creating encrypted data dataset...'
+        zfs create -o encryption=on -o keyformat=hex -o keylocation=file:///root/pve-data.key -o compression=on rpool/data
+        DATA_CREATED=true
+
+        log_data 'Restoring data datasets into encrypted parent...'
+        zfs send -R \"\$DATA_STAGE@\$DATA_SNAPSHOT\" | zfs receive -u -F -x encryption rpool/data
+
+        if ! zfs list rpool/data >/dev/null 2>&1; then
+            echo 'Error: Restored rpool/data dataset not found'
             exit 1
         fi
-        
-        zfs destroy -r rpool/data
-        
-        echo 'Creating encrypted data dataset...'
-        if ! zfs create -o encryption=on -o keyformat=hex -o keylocation=file:///root/pve-data.key -o compression=on rpool/data; then
-            echo 'Error: Failed to create encrypted data dataset'
-            # Attempt rollback
-            zfs send -R rpool/copydata@copy 2>/dev/null | zfs receive rpool/data || true
+
+        zfs load-key rpool/data
+
+        if ! zfs get -H -o value encryption rpool/data 2>/dev/null | grep -qv '^off$'; then
+            echo 'Error: Encryption is not enabled on rpool/data'
             exit 1
         fi
-        
-        # Restore child datasets if they exist
-        if zfs list -H -r -o name rpool/copydata 2>/dev/null | grep -q 'rpool/copydata/.'; then
-            echo 'Restoring child datasets...'
-            zfs send -R rpool/copydata@copy | zfs receive -x encryption rpool/data || true
+
+        if ! zfs get -H -o value keylocation rpool/data 2>/dev/null | grep -qx 'file:///root/pve-data.key'; then
+            echo 'Error: rpool/data keylocation is not set to /root/pve-data.key'
+            exit 1
         fi
-        
-        zfs destroy -r rpool/copydata
+
+        if ! zfs get -H -o value keystatus rpool/data 2>/dev/null | grep -qx 'available'; then
+            echo 'Error: rpool/data key is not loaded after migration'
+            exit 1
+        fi
+
+        if [ \"\$(zfs list -H -r -o name rpool/data | wc -l)\" -ne \"\$DATA_DESCENDANT_COUNT\" ]; then
+            echo 'Error: Restored rpool/data tree does not match the pre-migration dataset count'
+            exit 1
+        fi
+
+        log_data 'Cleaning up staging datasets and snapshots...'
+        zfs destroy -r \"\$DATA_STAGE\"
+        zfs destroy -r \"\$DATA_BACKUP\"
+        zfs destroy -r rpool/data@\"\$DATA_SNAPSHOT\"
+
+        trap - EXIT
         echo 'Data dataset encryption complete'
     " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"; then
-        echo -e "${CLR_YELLOW}Warning: Data dataset encryption had issues (non-critical)${CLR_RESET}"
+        echo -e "${CLR_RED}Error: Data dataset encryption failed${CLR_RESET}"
+        return 1
     fi
      
     echo -e "${CLR_GREEN}✓ ZFS data encryption complete.${CLR_RESET}"
@@ -1527,6 +1665,27 @@ install_zabbix_agent() {
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSHPORT root@$SSHIP "
         curl -fsSL https://wmp.github.io/zabbix/install.sh | bash -s -- $zabbix_server_address $agent_version_param $hostname_param
     " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to $SSHIP closed)"
+}
+
+validate_post_install_plugins() {
+    [ "$zfs_encryption" != true ] && return 0
+
+    echo -e "${CLR_CYAN}Validating installed system for ZFS encryption...${CLR_RESET}"
+
+    if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+        set -eu
+        zpool list rpool >/dev/null 2>&1
+        zfs list rpool/ROOT >/dev/null 2>&1
+        BOOTFS=\$(zpool get -H -o value bootfs rpool 2>/dev/null || true)
+        if [ -z \"\$BOOTFS\" ] || [ \"\$BOOTFS\" = '-' ]; then
+            BOOTFS=\$(zfs list -H -r -o name rpool/ROOT | awk 'NR==2 {print; exit}')
+        fi
+        [ -n \"\$BOOTFS\" ] && zfs list \"\$BOOTFS\" >/dev/null 2>&1
+    "; then
+        echo -e "${CLR_RED}✗ Error: --enable-zfs-encryption only works on Proxmox systems installed on ZFS.${CLR_RESET}"
+        echo "Manual installs must select ZFS in the installer. Automated installs must use --pve-filesystem zfs."
+        exit 1
+    fi
 }
 
 
@@ -1790,6 +1949,7 @@ echo
 ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSHPORT root@$SSHIP 2>&1 | grep -E -v "(Warning: Permanently added |Connection to $SSHIP closed)"
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSHPORT $SSHIP -C exit 2>&1 | grep -E -v "(Warning: Permanently added |Connection to $SSHIP closed)"
 
+validate_post_install_plugins
 
 # Run enabled plugins
 for plugin in $(echo "$plugin_list" | tr ',' '\n'); do
