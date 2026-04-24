@@ -1228,6 +1228,7 @@ enable_zfs_encryption() {
          pub_key=$(cat "$ssh_key")
     else
          echo -e "${CLR_YELLOW}Warning: No local public SSH key found to authorize for Dropbear. Trying to generate one...${CLR_RESET}"
+         mkdir -p /root/.ssh
          ssh-keygen -t rsa -N "" -f /root/.ssh/id_rsa
          pub_key=$(cat /root/.ssh/id_rsa.pub)
     fi
@@ -1368,6 +1369,19 @@ SERVICE
     # 3. Perform the ZFS Encryption Migration
     echo -e "${CLR_CYAN}Starting ZFS encryption migration (ROOT dataset)...${CLR_RESET}"
     echo -e "${CLR_YELLOW}Migrating ROOT with staged copies and rollback protection. Do not interrupt!${CLR_RESET}"
+
+    local pass_stage_output=""
+    if ! pass_stage_output=$(printf '%s\n' "$zfs_encryption_password" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
+        set -eu
+        umask 077
+        cat > /tmp/zfs_pass
+        chmod 600 /tmp/zfs_pass
+    " 2>&1); then
+        printf '%s\n' "$pass_stage_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
+        echo -e "${CLR_RED}Error: Failed to stage ZFS encryption passphrase${CLR_RESET}"
+        return 1
+    fi
+    printf '%s\n' "$pass_stage_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
     
     if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
         set -eu
@@ -1401,10 +1415,11 @@ SERVICE
 
         trap 'status=\$?; if [ \$status -ne 0 ]; then rollback_root; fi; cleanup_root; exit \$status' EXIT
 
-        umask 077
-        cat > \"\$PASSFILE\" << 'PASSEOF'
-$zfs_encryption_password
-PASSEOF
+        if [ ! -s \"\$PASSFILE\" ]; then
+            echo 'Error: ZFS passphrase file was not staged'
+            exit 1
+        fi
+        chmod 600 \"\$PASSFILE\"
 
         zpool import -f rpool 2>/dev/null || true
 
