@@ -4,7 +4,6 @@
 CLR_RED='\033[0;31m'
 CLR_GREEN='\033[0;32m'
 CLR_YELLOW='\033[1;33m'
-CLR_BLUE='\033[0;34m'
 CLR_CYAN='\033[0;36m'
 CLR_RESET='\033[0m'
 
@@ -414,7 +413,6 @@ if [ "$no_color" = true ] || [ ! -t 1 ]; then
     CLR_RED=''
     CLR_GREEN=''
     CLR_YELLOW=''
-    CLR_BLUE=''
     CLR_CYAN=''
     CLR_RESET=''
 fi
@@ -510,27 +508,36 @@ validate_zfs_encryption_request() {
         echo "Use --pve-filesystem zfs for automated installs."
         exit 1
     fi
+
+    case "$zfs_encryption_ssh_port" in
+        ''|*[!0-9]*)
+            echo -e "${CLR_RED}✗ Error: --zfs-encryption-ssh-port must be numeric.${CLR_RESET}"
+            exit 1
+            ;;
+    esac
 }
 
 validate_zfs_encryption_request
 
 WAN_IFACE=$(ip route show default | awk '/default/ {print $5}')
-PUBLIC_IPV4=$(ip -f inet addr show ${WAN_IFACE} | sed -En -e 's/.*inet ([0-9.]+).*/\1/p')
+PUBLIC_IPV4=$(ip -f inet addr show "${WAN_IFACE}" | sed -En -e 's/.*inet ([0-9.]+).*/\1/p')
 
 print_interface_names() {
     echo "Available network interfaces:"
     echo "================================"
 
-    for iface in $(ls /sys/class/net | grep -v lo); do
+    for iface_path in /sys/class/net/*; do
+        iface=$(basename "$iface_path")
+        [ "$iface" = lo ] && continue
         echo ""
         echo "Interface: $iface"
 
         # MAC address
-        mac=$(cat /sys/class/net/${iface}/address 2>/dev/null)
+        mac=$(cat /sys/class/net/"${iface}"/address 2>/dev/null)
         [ -n "$mac" ] && echo "  MAC: $mac"
 
         # Alternative names (altnames)
-        altnames=$(ip -d link show $iface 2>/dev/null | grep -oP 'altname \K[^ ]+' | tr '\n' ',' | sed 's/,$//')
+        altnames=$(ip -d link show "$iface" 2>/dev/null | grep -oP 'altname \K[^ ]+' | tr '\n' ',' | sed 's/,$//')
         [ -n "$altnames" ] && echo "  Altnames: $altnames"
 
         # Path-based name
@@ -620,17 +627,11 @@ update_locale_gen() {
 set_network() {
     curl -L "https://raw.githubusercontent.com/WMP/proxmox-hetzner/refs/heads/main/files/main_vmbr0_basic_template.txt" -o ~/interfaces_sample
 
-    # if [ "$specified_iface_name" ]; then
-    #     IFACE_NAME=$specified_iface_name
-    # else
-    #     IFACE_NAME="$(udevadm info -e | grep -m1 -A 20 ^P.*${WAN_IFACE} | grep ID_NET_NAME_PATH | cut -d'=' -f2)"
-    # fi
-
-    # Continue with setting up the network using the chosen IFACE_NAME
-    MAIN_IPV4_CIDR="$(ip address show ${WAN_IFACE} | grep global | grep "inet "| xargs | cut -d" " -f2)"
+    # Continue with setting up the network using the chosen interface.
+    MAIN_IPV4_CIDR="$(ip address show "${WAN_IFACE}" | grep global | grep "inet "| xargs | cut -d" " -f2)"
     MAIN_IPV4_GW="$(ip route | grep default | xargs | cut -d" " -f3)"
-    MAIN_IPV6_CIDR="$(ip address show ${WAN_IFACE} | grep global | grep "inet6 "| xargs | cut -d" " -f2)"
-    MAIN_MAC_ADDR="$(cat /sys/class/net/${WAN_IFACE}/address)"
+    MAIN_IPV6_CIDR="$(ip address show "${WAN_IFACE}" | grep global | grep "inet6 "| xargs | cut -d" " -f2)"
+    MAIN_MAC_ADDR="$(cat /sys/class/net/"${WAN_IFACE}"/address)"
 
     # Check if the MAIN_IPV4_CIDR variable has a value
     if [ -z "$MAIN_IPV4_CIDR" ]; then
@@ -656,7 +657,9 @@ set_network() {
         read -r MAIN_MAC_ADDR
     fi
 
-    # sed -i "s|#IFACE_NAME#|$IFACE_NAME|g" ~/interfaces_sample
+    if [ -n "$specified_iface_name" ]; then
+        sed -i "s|#IFACE_NAME#|$specified_iface_name|g" ~/interfaces_sample
+    fi
     sed -i "s|#MAIN_IPV4_CIDR#|$MAIN_IPV4_CIDR|g" ~/interfaces_sample
     sed -i "s|#MAIN_IPV4_GW#|$MAIN_IPV4_GW|g" ~/interfaces_sample
     sed -i "s|#MAIN_MAC_ADDR#|$MAIN_MAC_ADDR|g" ~/interfaces_sample
@@ -683,7 +686,9 @@ set_network() {
     # Configure DNS on the remote machine
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSHPORT $SSHIP "printf 'nameserver $DNS1\nnameserver $DNS2\n' > /etc/resolv.conf; sed -i 's/10.0.2.15/$PUBLIC_IPV4/' /etc/hosts;"  2>&1  | grep -E -v "(Warning: Permanently added |Connection to $SSHIP closed)"
 
-    configure_network_interface
+    if [ -z "$specified_iface_name" ]; then
+        configure_network_interface
+    fi
 }
 
 configure_network_interface() {
@@ -781,13 +786,13 @@ show_block_devices() {
 
         # Model
         if [ -f "$disk/device/model" ]; then
-            model=$(cat "$disk/device/model" | tr -d ' ')
+            model=$(tr -d ' ' < "$disk/device/model")
             echo "  Model: $model"
         fi
 
         # Vendor
         if [ -f "$disk/device/vendor" ]; then
-            vendor=$(cat "$disk/device/vendor" | tr -d ' ')
+            vendor=$(tr -d ' ' < "$disk/device/vendor")
             echo "  Vendor: $vendor"
         fi
 
@@ -812,31 +817,33 @@ show_network_interfaces() {
     echo -e "${CLR_CYAN}=== Network Interfaces ===${CLR_RESET}"
     echo ""
 
-    for iface in $(ls /sys/class/net | grep -v lo); do
+    for iface_path in /sys/class/net/*; do
+        iface=$(basename "$iface_path")
+        [ "$iface" = lo ] && continue
         echo "Interface: $iface"
 
         # MAC address
-        if [ -f /sys/class/net/$iface/address ]; then
-            mac=$(cat /sys/class/net/$iface/address)
+        if [ -f /sys/class/net/"$iface"/address ]; then
+            mac=$(cat /sys/class/net/"$iface"/address)
             echo "  MAC: $mac"
         fi
 
         # Speed
-        if [ -f /sys/class/net/$iface/speed ]; then
-            speed=$(cat /sys/class/net/$iface/speed 2>/dev/null)
+        if [ -f /sys/class/net/"$iface"/speed ]; then
+            speed=$(cat /sys/class/net/"$iface"/speed 2>/dev/null)
             [ -n "$speed" ] && [ "$speed" != "-1" ] && echo "  Speed: ${speed}Mbps"
         fi
 
         # Driver
-        if [ -L /sys/class/net/$iface/device/driver ]; then
-            driver=$(basename $(readlink /sys/class/net/$iface/device/driver))
+        if [ -L /sys/class/net/"$iface"/device/driver ]; then
+            driver=$(basename "$(readlink /sys/class/net/"$iface"/device/driver)")
             echo "  Driver: $driver"
         fi
 
         # PCI ID
-        if [ -f /sys/class/net/$iface/device/vendor ]; then
-            vendor=$(cat /sys/class/net/$iface/device/vendor)
-            device=$(cat /sys/class/net/$iface/device/device 2>/dev/null)
+        if [ -f /sys/class/net/"$iface"/device/vendor ]; then
+            vendor=$(cat /sys/class/net/"$iface"/device/vendor)
+            device=$(cat /sys/class/net/"$iface"/device/device 2>/dev/null)
             echo "  PCI: $vendor:$device"
         fi
 
@@ -861,9 +868,10 @@ generate_answer_toml() {
         local toml_disks=()
 
         IFS=',' read -ra USER_DISKS <<< "$pve_disk_list"
-        for user_disk in "${USER_DISKS[@]}"; do
+        for _user_disk in "${USER_DISKS[@]}"; do
             # Map to virtio device: first disk -> vda, second -> vdb, etc.
-            local virt_letter=$(printf "\x$(printf %x $((97 + disk_index)))")  # 97 = 'a' in ASCII
+            local virt_letter
+            printf -v virt_letter '%b' "\\$(printf '%03o' $((97 + disk_index)))"  # 97 = 'a' in ASCII
             toml_disks+=("/dev/vd${virt_letter}")
             ((disk_index++))
         done
@@ -878,21 +886,19 @@ generate_answer_toml() {
     # Get network configuration from set_network variables
     local gateway="${MAIN_IPV4_GATEWAY}"
     local cidr="${MAIN_IPV4_CIDR}"
-    local interface="${MAIN_IFACE_NAME}"
 
-    # DNS servers based on platform
-    local dns1 dns2
+    # DNS server based on platform
+    local dns1
     if [ "$use_ovh" = true ]; then
         dns1="213.186.33.99"
-        dns2="8.8.8.8"
     else
         dns1="185.12.64.1"
-        dns2="185.12.64.2"
     fi
 
     # Extract last 12 hex chars from MAC address (removes colons)
     # MAC format: aa:bb:cc:dd:ee:ff -> filter needs last 6 bytes: *ddeeff (without colons)
-    local mac_filter="*$(echo "$MAIN_MAC_ADDR" | tr -d ':' | tail -c 13)"
+    local mac_filter
+    mac_filter="*$(echo "$MAIN_MAC_ADDR" | tr -d ':' | tail -c 13)"
 
     # Read SSH public key if it exists
     local ssh_pub_key=""
@@ -1015,17 +1021,16 @@ download_latest_proxmox_iso() {
 
     echo "Downloading the latest ISO file"
     if curl --help all | grep -q -- --remove-on-error; then
-        curl --remove-on-error -o "$latest_iso_name" "$ISO_URL/$latest_iso_name"
-    else
-        curl -o "$latest_iso_name" "$ISO_URL/$latest_iso_name"
-    fi
-
-    if [ $? -eq 0 ]; then
-        echo -e "${CLR_GREEN}✓ Downloaded the latest ISO image: $latest_iso_name${CLR_RESET}"
-    else
+        if ! curl --remove-on-error -o "$latest_iso_name" "$ISO_URL/$latest_iso_name"; then
+            echo -e "${CLR_RED}✗ Error downloading the ISO image.${CLR_RESET}"
+            exit 1
+        fi
+    elif ! curl -o "$latest_iso_name" "$ISO_URL/$latest_iso_name"; then
         echo -e "${CLR_RED}✗ Error downloading the ISO image.${CLR_RESET}"
         exit 1
     fi
+
+    echo -e "${CLR_GREEN}✓ Downloaded the latest ISO image: $latest_iso_name${CLR_RESET}"
 }
 
 # Function to create auto-install ISO using proxmox-auto-install-assistant
@@ -1240,20 +1245,30 @@ enable_zfs_encryption() {
     fi
 
     # Configure remote server
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "
-        set -e
-        # Add public key to dropbear authorized_keys
-        mkdir -p /etc/dropbear-initramfs
-        touch /etc/dropbear-initramfs/authorized_keys
-        grep -qxF '$pub_key' /etc/dropbear-initramfs/authorized_keys || echo '$pub_key' >> /etc/dropbear-initramfs/authorized_keys
-        chmod 700 /etc/dropbear-initramfs
-        chmod 600 /etc/dropbear-initramfs/authorized_keys
+    local pub_key_b64=""
+    pub_key_b64=$(printf '%s' "$pub_key" | base64 -w0)
 
-        # Configure Dropbear options (port, etc)
-        # We ensure it listens on the specified port and forces the zfsunlock command on login
-        
-        # Create the zfsunlock script
-        cat <<'UNLOCK' > /usr/local/bin/zfsunlock
+    local dropbear_config_output=""
+    if ! dropbear_config_output=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSHPORT" "$SSHIP" "PUBLIC_KEY_B64=$pub_key_b64 ZFS_UNLOCK_PORT=$zfs_encryption_ssh_port bash -s" <<'REMOTE_ZFS_CONFIG' 2>&1
+set -e
+PUBLIC_KEY=$(printf '%s' "$PUBLIC_KEY_B64" | base64 -d)
+
+# Add public key to dropbear authorized_keys
+mkdir -p /etc/dropbear-initramfs
+: > /etc/dropbear-initramfs/authorized_keys.tmp
+if [ -f /etc/dropbear-initramfs/authorized_keys ]; then
+    cat /etc/dropbear-initramfs/authorized_keys > /etc/dropbear-initramfs/authorized_keys.tmp
+fi
+grep -qxF "$PUBLIC_KEY" /etc/dropbear-initramfs/authorized_keys.tmp || printf '%s\n' "$PUBLIC_KEY" >> /etc/dropbear-initramfs/authorized_keys.tmp
+mv /etc/dropbear-initramfs/authorized_keys.tmp /etc/dropbear-initramfs/authorized_keys
+chmod 700 /etc/dropbear-initramfs
+chmod 600 /etc/dropbear-initramfs/authorized_keys
+
+# Configure Dropbear options (port, etc)
+# We ensure it listens on the specified port and forces the zfsunlock command on login
+
+# Create the zfsunlock script
+cat <<'UNLOCK' > /usr/local/bin/zfsunlock
 #!/bin/sh
 echo "Unlocking ZFS datasets..."
 if zfs load-key -a; then
@@ -1271,17 +1286,17 @@ else
     exit 1
 fi
 UNLOCK
-        chmod +x /usr/local/bin/zfsunlock
+chmod +x /usr/local/bin/zfsunlock
 
-        # Create hook to include zfsunlock in initramfs
-        if [ ! -f /etc/initramfs-tools/hooks/zfsunlock_hook ]; then
-            cat <<'HOOK' > /etc/initramfs-tools/hooks/zfsunlock_hook
+# Create hook to include zfsunlock in initramfs
+if [ ! -f /etc/initramfs-tools/hooks/zfsunlock_hook ]; then
+    cat <<'HOOK' > /etc/initramfs-tools/hooks/zfsunlock_hook
 #!/bin/sh
 PREREQ=""
 prereqs() {
-    echo "\$PREREQ"
+    echo "$PREREQ"
 }
-case \$1 in
+case $1 in
     prereqs)
         prereqs
         exit 0
@@ -1290,61 +1305,61 @@ esac
 . /usr/share/initramfs-tools/hook-functions
 copy_exec /usr/local/bin/zfsunlock /bin/zfsunlock
 HOOK
-            chmod +x /etc/initramfs-tools/hooks/zfsunlock_hook
-        fi
+    chmod +x /etc/initramfs-tools/hooks/zfsunlock_hook
+fi
 
-        # Update Dropbear config to force this command
-        # Note: Using $zfs_encryption_ssh_port from outer shell scope
-        if grep -q '^#\?DROPBEAR_OPTIONS=' /etc/dropbear-initramfs/config 2>/dev/null; then
-            sed -i 's|^#\?DROPBEAR_OPTIONS=.*|DROPBEAR_OPTIONS=\"-p $zfs_encryption_ssh_port -j -k -c /bin/zfsunlock\"|' /etc/dropbear-initramfs/config
+# Update Dropbear config to force this command
+DROPBEAR_LINE="DROPBEAR_OPTIONS=\"-p ${ZFS_UNLOCK_PORT} -j -k -c /bin/zfsunlock\""
+if grep -q '^#\?DROPBEAR_OPTIONS=' /etc/dropbear-initramfs/config 2>/dev/null; then
+    sed -i "s|^#\?DROPBEAR_OPTIONS=.*|$DROPBEAR_LINE|" /etc/dropbear-initramfs/config
+else
+    printf '%s\n' "$DROPBEAR_LINE" >> /etc/dropbear-initramfs/config
+fi
+
+# Configure static IP in initramfs
+echo 'Configuring network for initramfs...'
+
+# Extract IP/CIDR and Gateway from interfaces file
+IP_CIDR=$(grep -E '^\s*address' /etc/network/interfaces | awk '{print $2}' | head -n1)
+GW=$(grep -E '^\s*gateway' /etc/network/interfaces | awk '{print $2}' | head -n1)
+
+if [ -n "$IP_CIDR" ] && [ -n "$GW" ]; then
+    IP=${IP_CIDR%/*}
+    CIDR=${IP_CIDR#*/}
+
+    # Default CIDR to 24 if extraction failed
+    [ -z "$CIDR" ] && CIDR=24
+
+    # Calculate netmask from CIDR using pure shell
+    FULL_OCTETS=$((CIDR / 8))
+    REM_BITS=$((CIDR % 8))
+    MASK=""
+
+    for i in 1 2 3 4; do
+        if [ "$i" -le "$FULL_OCTETS" ]; then
+            VAL=255
+        elif [ "$i" -eq $((FULL_OCTETS + 1)) ]; then
+            VAL=$(( 256 - (1 << (8 - REM_BITS)) ))
         else
-            echo 'DROPBEAR_OPTIONS=\"-p $zfs_encryption_ssh_port -j -k -c /bin/zfsunlock\"' >> /etc/dropbear-initramfs/config
+            VAL=0
         fi
+        [ -z "$MASK" ] && MASK="$VAL" || MASK="${MASK}.${VAL}"
+    done
 
-        # Configure static IP in initramfs
-        echo 'Configuring network for initramfs...'
-        
-        # Extract IP/CIDR and Gateway from interfaces file
-        IP_CIDR=\$(grep -E '^\s*address' /etc/network/interfaces | awk '{print \$2}' | head -n1)
-        GW=\$(grep -E '^\s*gateway' /etc/network/interfaces | awk '{print \$2}' | head -n1)
-        
-        if [ -n "\$IP_CIDR" ] && [ -n "\$GW" ]; then
-            IP=\${IP_CIDR%/*}
-            CIDR=\${IP_CIDR#*/}
-            
-            # Default CIDR to 24 if extraction failed
-            [ -z "\$CIDR" ] && CIDR=24
-            
-            # Calculate netmask from CIDR using pure shell
-            FULL_OCTETS=\$((CIDR / 8))
-            REM_BITS=\$((CIDR % 8))
-            MASK=""
-            
-            for i in 1 2 3 4; do
-                if [ \$i -le \$FULL_OCTETS ]; then
-                    VAL=255
-                elif [ \$i -eq \$((FULL_OCTETS + 1)) ]; then
-                    VAL=\$(( 256 - (1 << (8 - REM_BITS)) ))
-                else
-                    VAL=0
-                fi
-                [ -z "\$MASK" ] && MASK="\$VAL" || MASK="\${MASK}.\$VAL"
-            done
-            
-            # Add kernel parameter to initramfs.conf
-            IP_PARAM="IP=\${IP}::\${GW}:\${MASK}:proxmox::off"
-            echo "Network config: \$IP_PARAM"
-            if grep -q '^IP=' /etc/initramfs-tools/initramfs.conf 2>/dev/null; then
-                sed -i "s|^IP=.*|\$IP_PARAM|" /etc/initramfs-tools/initramfs.conf
-            else
-                echo "\$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
-            fi
-        else
-            echo 'Warning: Could not detect network config. Manual configuration may be needed.'
-        fi
+    # Add kernel parameter to initramfs.conf
+    IP_PARAM="IP=${IP}::${GW}:${MASK}:proxmox::off"
+    echo "Network config: $IP_PARAM"
+    if grep -q '^IP=' /etc/initramfs-tools/initramfs.conf 2>/dev/null; then
+        sed -i "s|^IP=.*|$IP_PARAM|" /etc/initramfs-tools/initramfs.conf
+    else
+        printf '%s\n' "$IP_PARAM" >> /etc/initramfs-tools/initramfs.conf
+    fi
+else
+    echo 'Warning: Could not detect network config. Manual configuration may be needed.'
+fi
 
-        # Enable zfs-load-key service
-        cat <<'SERVICE' > /etc/systemd/system/zfs-load-keys.service
+# Enable zfs-load-key service
+cat <<'SERVICE' > /etc/systemd/system/zfs-load-keys.service
 [Unit]
 Description=Load ZFS encryption keys
 DefaultDependencies=no
@@ -1359,12 +1374,18 @@ ExecStart=/usr/sbin/zfs load-key rpool/data
 [Install]
 WantedBy=zfs-mount.service
 SERVICE
-        
-        systemctl enable zfs-load-keys.service 2>&1 || true
-        
-        echo 'Updating initramfs...'
-        update-initramfs -u -k all
-    " 2>&1 | grep -E -v "(Warning: Permanently added |Connection to.*closed)"
+
+systemctl enable zfs-load-keys.service 2>&1 || true
+
+echo 'Updating initramfs...'
+update-initramfs -u -k all
+REMOTE_ZFS_CONFIG
+    ); then
+        printf '%s\n' "$dropbear_config_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
+        echo -e "${CLR_RED}Error: Failed to configure Dropbear SSH for initramfs${CLR_RESET}"
+        return 1
+    fi
+    printf '%s\n' "$dropbear_config_output" | grep -E -v "(Warning: Permanently added |Connection to.*closed)" || true
 
     # 3. Perform the ZFS Encryption Migration
     echo -e "${CLR_CYAN}Starting ZFS encryption migration (ROOT dataset)...${CLR_RESET}"
@@ -1749,12 +1770,13 @@ if [ "$verbose" = true ]; then
     device_path="/dev/vd"
     counter=97  # ASCII code for 'a'
     for ((i = 0; i < ${#hard_disks_text[@]}; i++)); do
-        if (( $counter > 122 )); then  # If ASCII code exceeds 'z'
+        if (( counter > 122 )); then  # If ASCII code exceeds 'z'
             echo "Too many disks to assign"
             break
         fi
         # Append device path to each disk entry
-        hard_disks_text[$i]="${hard_disks_text[$i]} $device_path$(printf "\x$(printf %x $counter)")"
+        printf -v virt_suffix '%b' "\\$(printf '%03o' "$counter")"
+        hard_disks_text[i]="${hard_disks_text[i]} $device_path$virt_suffix"
         ((counter++))
     done
 
@@ -1771,7 +1793,7 @@ done < <(lsblk -o NAME -d -n -p | grep -v 'loop' | grep -v 'sr')
 
 latest_machine=$(qemu-system-x86_64 -machine help | grep -oP "pc-q35-\d+\.\d+" | sort -V | tail -n 1)
 
-if [ ! -n "$vnc_password" ]; then
+if [ -z "$vnc_password" ]; then
     # Generate random VNC password
     vnc_password=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
 fi
@@ -1839,7 +1861,7 @@ if [ "$skip_installer" = false ]; then
             echo -e "${CLR_YELLOW}This will perform an automated installation on the selected disks.${CLR_RESET}"
             echo -e "${CLR_RED}WARNING: All data on the selected disks will be erased!${CLR_RESET}"
             echo ""
-            read -p "Do you want to continue? (yes/no): " confirmation
+            read -r -p "Do you want to continue? (yes/no): " confirmation
 
             if [ "$confirmation" != "yes" ] && [ "$confirmation" != "y" ]; then
                 echo -e "${CLR_RED}Installation cancelled by user${CLR_RESET}"
@@ -1864,7 +1886,7 @@ if [ "$skip_installer" = false ]; then
         # Use regular ISO for manual VNC installation
         install_iso="$latest_iso_name"
 
-        if [ ! -n "$vnc_password" ]; then
+        if [ -z "$vnc_password" ]; then
             # Generate random VNC password
             vnc_password=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
         fi
@@ -1947,7 +1969,10 @@ else
     eval "$qemu_command > /dev/null 2>&1 &"
 fi
 
-bg_pid=$!
+qemu_pid=$!
+if [ "$verbose" = true ]; then
+    echo "QEMU started with PID: $qemu_pid"
+fi
 
 # Performing SSH operations
 if [ ! -f /root/.ssh/id_rsa ]; then
